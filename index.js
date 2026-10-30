@@ -1,8 +1,6 @@
 const { VK } = require("vk-io");
 const { Bot, Keyboard } = require("@maxhub/max-bot-api");
 require("dotenv").config();
-const path = require("path");
-const fs = require("fs");
 
 if (typeof global.fetch === "undefined") global.fetch = require("node-fetch");
 
@@ -28,7 +26,6 @@ const adminKeyboard = Keyboard.inlineKeyboard([
 
 // ========== ФУНКЦИИ С RETRY ==========
 
-// Функция с ретраем для API запросов
 async function withRetry(fn, maxRetries = 3, delay = 1000) {
   let lastError;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -39,9 +36,7 @@ async function withRetry(fn, maxRetries = 3, delay = 1000) {
       console.log(
         `⚠️ Попытка ${attempt}/${maxRetries} не удалась: ${error.message}`,
       );
-
       if (attempt < maxRetries) {
-        // Экспоненциальная задержка
         const waitTime = delay * Math.pow(2, attempt - 1);
         console.log(`⏳ Ожидание ${waitTime}мс перед повторной попыткой...`);
         await new Promise((resolve) => setTimeout(resolve, waitTime));
@@ -51,13 +46,26 @@ async function withRetry(fn, maxRetries = 3, delay = 1000) {
   throw lastError;
 }
 
-// Функция для преобразования ссылок VK в нормальный вид
+// ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
+// Преобразование ссылок VK
 function fixVKLinks(text) {
   if (!text) return "";
   return text.replace(/\[#alias\|([^|\]]+)\|([^|\]]+)\]/g, "$2");
 }
 
-// Функция для получения лучшего фото
+// Получение ссылки на пост в VK
+function getVKPostLink(post) {
+  return `https://vk.com/wall${post.owner_id}_${post.id}`;
+}
+
+// Проверка наличия видео в посте
+function hasVideo(post) {
+  if (!post.attachments) return false;
+  return post.attachments.some((attach) => attach.type === "video");
+}
+
+// Получение лучшего фото
 function getBestPhoto(photo) {
   if (!photo?.sizes) return null;
   return photo.sizes.reduce((a, b) =>
@@ -65,13 +73,14 @@ function getBestPhoto(photo) {
   ).url;
 }
 
-// Функция отправки в MAX (с ретраем)
-async function sendToMax(text, images = []) {
+// ========== ОТПРАВКА В MAX ==========
+async function sendToMax(text, images = [], post = null) {
   try {
-    const fixedText = fixVKLinks(text);
+    let fixedText = fixVKLinks(text);
     const attachments = [];
+    let failedImages = 0;
 
-    // Загружаем картинки с ретраем
+    // Загружаем картинки — каждая отдельно, ошибки не прерывают процесс
     for (const url of images.slice(0, 10)) {
       try {
         const img = await withRetry(
@@ -84,17 +93,54 @@ async function sendToMax(text, images = []) {
         attachments.push(img.toJson());
         console.log(`✅ Фото загружено`);
       } catch (e) {
+        failedImages++;
         console.log(`⚠️ Не удалось загрузить фото: ${e.message}`);
-        await notifyAdmin(`⚠️ Не удалось загрузить фото: ${e.message}`, true);
       }
     }
 
-    // Отправляем сообщение с ретраем
+    // Если есть видео или не все картинки загрузились — добавляем ссылку на пост
+    const hasVideoContent = post && hasVideo(post);
+    const someImagesFailed = failedImages > 0;
+
+    if (post && (hasVideoContent || someImagesFailed)) {
+      const postLink = getVKPostLink(post);
+      const note = hasVideoContent
+        ? `\n\n🎬 В посте есть видео. Смотреть в VK: ${postLink}`
+        : `\n\n📎 Часть вложений недоступна. Оригинал: ${postLink}`;
+      fixedText += note;
+      console.log(
+        `🔗 Добавлена ссылка на пост в VK (видео: ${hasVideoContent}, ошибок фото: ${failedImages})`,
+      );
+    }
+
+    // Если вообще нет контента — отправляем только ссылку
+    if (!fixedText.trim() && attachments.length === 0) {
+      if (post) {
+        await withRetry(
+          async () => {
+            await bot.api.sendMessageToChat(
+              MAX_CHAT_ID,
+              `📎 Новый пост в VK: ${getVKPostLink(post)}`,
+              { format: "markdown" },
+            );
+          },
+          3,
+          2000,
+        );
+        console.log(`✅ Отправлена ссылка на пост`);
+        await notifyAdmin(`✅ Отправлена ссылка на пост (без медиа)`, false);
+        return true;
+      }
+      return false;
+    }
+
+    // Отправляем сообщение
     await withRetry(
       async () => {
         await bot.api.sendMessageToChat(
           MAX_CHAT_ID,
-          fixedText || (images.length > 0 ? "📸 Новый пост" : "📝 Новый пост"),
+          fixedText ||
+            (attachments.length > 0 ? "📸 Новый пост" : "📝 Новый пост"),
           {
             attachments: attachments.length > 0 ? attachments : undefined,
             format: "markdown",
@@ -105,8 +151,13 @@ async function sendToMax(text, images = []) {
       2000,
     );
 
-    console.log(`✅ Пост отправлен в MAX`);
-    await notifyAdmin(`✅ Пост успешно отправлен в MAX`, false);
+    console.log(
+      `✅ Пост отправлен в MAX (фото: ${attachments.length}, ошибок: ${failedImages})`,
+    );
+    await notifyAdmin(
+      `✅ Пост успешно отправлен в MAX (фото: ${attachments.length})`,
+      false,
+    );
     return true;
   } catch (error) {
     console.error(`❌ Ошибка отправки в MAX: ${error.message}`);
@@ -115,11 +166,10 @@ async function sendToMax(text, images = []) {
   }
 }
 
-// Функция для уведомления админа (с ретраем)
+// ========== УВЕДОМЛЕНИЕ АДМИНА ==========
 async function notifyAdmin(message, showRetryButton = false) {
   try {
     const options = showRetryButton ? { attachments: [adminKeyboard] } : {};
-
     await withRetry(
       async () => {
         await bot.api.sendMessageToUser(
@@ -136,7 +186,7 @@ async function notifyAdmin(message, showRetryButton = false) {
   }
 }
 
-// ========== ФУНКЦИЯ РЕПОСТА ==========
+// ========== РЕПОСТ ==========
 async function repostLastPost() {
   if (!lastPost) {
     await notifyAdmin("❌ Нет сохраненного поста для репоста");
@@ -161,7 +211,7 @@ async function repostLastPost() {
     }
   }
 
-  const success = await sendToMax(text, images);
+  const success = await sendToMax(text, images, post);
 
   if (success) {
     console.log("✅ Пост успешно переопубликован!");
@@ -188,6 +238,7 @@ vk.updates.on("wall_post_new", async (ctx) => {
 
     const text = post.text || "";
     const images = [];
+    let hasVideoContent = false;
 
     if (post.attachments) {
       for (const attach of post.attachments) {
@@ -198,11 +249,15 @@ vk.updates.on("wall_post_new", async (ctx) => {
             console.log(`🖼 Найдено фото`);
           }
         }
+        if (attach.type === "video") {
+          hasVideoContent = true;
+          console.log(`🎬 Найдено видео`);
+        }
       }
     }
 
-    if (text.trim() || images.length > 0) {
-      const success = await sendToMax(text, images);
+    if (text.trim() || images.length > 0 || hasVideoContent) {
+      const success = await sendToMax(text, images, post);
       if (!success) {
         lastPostError = "Ошибка при отправке поста";
       }
@@ -260,12 +315,10 @@ bot.on("message_created", async (ctx) => {
 bot.action("retry_last_post", async (ctx) => {
   try {
     const userId = ctx.callback.user.user_id;
-
     if (String(userId) !== String(process.env.SUPER_ADMIN_ID_MAX)) {
       await ctx.reply("❌ Нет доступа");
       return;
     }
-
     await ctx.reply("🔄 Пробую переопубликовать...");
     await repostLastPost();
   } catch (error) {
@@ -276,7 +329,6 @@ bot.action("retry_last_post", async (ctx) => {
 bot.action("bot_status", async (ctx) => {
   try {
     const userId = ctx.callback.user.user_id;
-
     if (String(userId) !== String(process.env.SUPER_ADMIN_ID_MAX)) {
       await ctx.reply("❌ Нет доступа");
       return;
@@ -295,16 +347,14 @@ bot.action("bot_status", async (ctx) => {
   }
 });
 
-// ========== ФУНКЦИЯ ЗАПУСКА С ВОССТАНОВЛЕНИЕМ ==========
+// ========== ЗАПУСК С ВОССТАНОВЛЕНИЕМ ==========
 async function startBotWithRecovery() {
   try {
     console.log("🚀 Запуск бота...");
 
-    // Запускаем VK polling
     await vk.updates.startPolling();
     console.log("✅ VK polling запущен");
 
-    // Запускаем MAX бота с обработкой ошибок
     await bot.start();
     console.log("✅ MAX бот запущен");
 
@@ -315,7 +365,6 @@ async function startBotWithRecovery() {
     console.log(`💬 MAX чат ID: ${MAX_CHAT_ID}`);
     console.log("⏳ Ожидание новых постов...\n");
 
-    // Отправляем приветствие админу
     await bot.api.sendMessageToUser(
       process.env.SUPER_ADMIN_ID_MAX,
       "🤖 Бот запущен!\n\nДоступные команды:\n/repost - повторить последний пост\n/status - статус бота",
@@ -324,13 +373,11 @@ async function startBotWithRecovery() {
     console.log("✅ Админ оповещен\n");
   } catch (error) {
     console.error("❌ Ошибка запуска:", error.message);
-
-    // Пытаемся перезапустить
     await handleBotCrash(error);
   }
 }
 
-// ========== ОБРАБОТКА КРАША БОТА ==========
+// ========== ОБРАБОТКА КРАША ==========
 async function handleBotCrash(error) {
   console.error("💥 Бот упал:", error.message);
   isBotHealthy = false;
@@ -347,23 +394,19 @@ async function handleBotCrash(error) {
   reconnectAttempts++;
 
   if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
-    const delay = 5000 * Math.pow(2, reconnectAttempts - 1); // 5s, 10s, 20s, 40s, 80s
+    const delay = 5000 * Math.pow(2, reconnectAttempts - 1);
     console.log(
       `⏳ Перезапуск через ${delay / 1000} секунд (попытка ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`,
     );
 
     setTimeout(async () => {
       try {
-        // Останавливаем старый экземпляр
         try {
           await bot.stop();
         } catch (e) {}
-
         try {
           await vk.updates.stopPolling();
         } catch (e) {}
-
-        // Перезапускаем
         await startBotWithRecovery();
       } catch (error) {
         console.error("❌ Критическая ошибка при перезапуске:", error);
@@ -380,8 +423,7 @@ async function handleBotCrash(error) {
   }
 }
 
-// ========== ОБРАБОТКА ОШИБОК ПОЛЛИНГА ==========
-// Перехватываем ошибки в polling и перезапускаем
+// ========== ПЕРЕХВАТ ОШИБОК POLLING ==========
 const originalPollingLoop = bot.start;
 bot.start = async function () {
   try {
@@ -395,7 +437,7 @@ bot.start = async function () {
 // ========== ЗАПУСК ==========
 startBotWithRecovery();
 
-// Обработка Ctrl+C
+// ========== ОБРАБОТКА СИГНАЛОВ ==========
 process.on("SIGINT", async () => {
   console.log("\n👋 Получен сигнал остановки...");
   try {
@@ -406,7 +448,6 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-// Обработка необработанных ошибок
 process.on("uncaughtException", async (error) => {
   console.error("💥 Необработанное исключение:", error);
   await handleBotCrash(error);
